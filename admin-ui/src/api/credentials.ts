@@ -8,6 +8,11 @@ import type {
   SetPriorityRequest,
   AddCredentialRequest,
   AddCredentialResponse,
+  UpdateProxyRequest,
+  ProxyProfileStatus,
+  CreateProxyRequest,
+  UpdateProxyProfileRequest,
+  AddProxyResponse,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -54,6 +59,41 @@ export async function setCredentialPriority(
     `/credentials/${id}/priority`,
     { priority } as SetPriorityRequest
   )
+  return data
+}
+
+// 更新或清除凭据级代理配置
+export async function updateCredentialProxy(
+  id: number,
+  req: UpdateProxyRequest
+): Promise<SuccessResponse> {
+  const { data } = await api.patch<SuccessResponse>(
+    `/credentials/${id}/proxy`,
+    req
+  )
+  return data
+}
+
+export async function getProxyProfiles(): Promise<ProxyProfileStatus[]> {
+  const { data } = await api.get<ProxyProfileStatus[]>('/proxies')
+  return data
+}
+
+export async function addProxyProfile(req: CreateProxyRequest): Promise<AddProxyResponse> {
+  const { data } = await api.post<AddProxyResponse>('/proxies', req)
+  return data
+}
+
+export async function updateProxyProfile(
+  id: number,
+  req: UpdateProxyProfileRequest
+): Promise<SuccessResponse> {
+  const { data } = await api.patch<SuccessResponse>(`/proxies/${id}`, req)
+  return data
+}
+
+export async function deleteProxyProfile(id: number): Promise<SuccessResponse> {
+  const { data } = await api.delete<SuccessResponse>(`/proxies/${id}`)
   return data
 }
 

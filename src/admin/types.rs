@@ -55,6 +55,10 @@ pub struct CredentialStatusItem {
     /// 代理 URL（用于前端展示）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
+    /// 代理库条目 ID
+    pub proxy_id: Option<u64>,
+    /// 代理库条目名称
+    pub proxy_name: Option<String>,
     /// Token 刷新连续失败次数
     pub refresh_failure_count: u32,
     /// 禁用原因
@@ -80,6 +84,52 @@ pub struct SetDisabledRequest {
 pub struct SetPriorityRequest {
     /// 新优先级值
     pub priority: u32,
+}
+
+/// 修改凭据级代理配置请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateProxyRequest {
+    /// 代理库条目 ID；设置后账号引用该条目
+    pub proxy_id: Option<u64>,
+    /// 代理 URL，支持 http(s)、socks5 或 direct；未提供时保留现有 URL
+    pub proxy_url: Option<String>,
+    /// 代理用户名；未提供时保留现有用户名
+    pub proxy_username: Option<String>,
+    /// 代理密码；未提供或为空时保留现有密码
+    pub proxy_password: Option<String>,
+    /// 是否移除该凭据的全部代理配置
+    #[serde(default)]
+    pub clear: bool,
+}
+
+/// 创建代理库条目请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateProxyRequest {
+    pub name: String,
+    /// 支持两种带认证的快捷格式，也支持标准 URL
+    pub proxy: String,
+}
+
+/// 修改代理库条目请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateProxyProfileRequest {
+    pub name: String,
+    pub proxy: String,
+    /// 未提供时保留已有用户名
+    pub username: Option<String>,
+    /// 未提供或为空时保留已有密码
+    pub password: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddProxyResponse {
+    pub success: bool,
+    pub message: String,
+    pub proxy_id: u64,
 }
 
 /// 添加凭据请求

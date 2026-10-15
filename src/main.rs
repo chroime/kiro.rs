@@ -14,6 +14,7 @@ use clap::Parser;
 use kiro::endpoint::{IdeEndpoint, KiroEndpoint};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
+use kiro::proxy_pool::ProxyPool;
 use kiro::token_manager::MultiTokenManager;
 use model::arg::Args;
 use model::config::Config;
@@ -37,6 +38,15 @@ async fn main() {
         .unwrap_or_else(|| Config::default_config_path().to_string());
     let config = Config::load(&config_path).unwrap_or_else(|e| {
         tracing::error!("加载配置失败: {}", e);
+        std::process::exit(1);
+    });
+
+    let proxy_pool_path = std::path::Path::new(&config_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("proxies.json");
+    let proxy_pool = ProxyPool::load(proxy_pool_path).unwrap_or_else(|e| {
+        tracing::error!("加载代理库失败: {}", e);
         std::process::exit(1);
     });
 
@@ -129,12 +139,13 @@ async fn main() {
     let endpoint_names: Vec<String> = endpoints.keys().cloned().collect();
 
     // 创建 MultiTokenManager 和 KiroProvider
-    let token_manager = MultiTokenManager::new(
+    let token_manager = MultiTokenManager::new_with_proxy_pool(
         config.clone(),
         credentials_list,
         proxy_config.clone(),
         Some(credentials_path.into()),
         is_multiple_format,
+        proxy_pool,
     )
     .unwrap_or_else(|e| {
         tracing::error!("创建 Token 管理器失败: {}", e);
@@ -210,6 +221,9 @@ async fn main() {
         tracing::info!("  POST /api/admin/credentials/:index/priority");
         tracing::info!("  POST /api/admin/credentials/:index/reset");
         tracing::info!("  GET  /api/admin/credentials/:index/balance");
+        tracing::info!("  PATCH /api/admin/credentials/:index/proxy");
+        tracing::info!("  GET/POST /api/admin/proxies");
+        tracing::info!("  PATCH/DELETE /api/admin/proxies/:id");
         tracing::info!("Admin UI:");
         tracing::info!("  GET  /admin");
     }

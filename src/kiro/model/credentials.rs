@@ -8,6 +8,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::http_client::ProxyConfig;
+use crate::kiro::proxy_pool::ProxyPool;
 use crate::model::config::Config;
 
 /// Kiro OAuth 凭证
@@ -92,6 +93,10 @@ pub struct KiroCredentials {
     /// 凭据级代理认证密码（可选）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_password: Option<String>,
+
+    /// 代理库条目 ID。设置后优先使用代理库中的动态配置。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_id: Option<u64>,
 
     /// 凭据是否被禁用（默认为 false）
     #[serde(default)]
@@ -234,6 +239,20 @@ impl KiroCredentials {
         }
     }
 
+    /// 获取有效代理，优先解析代理库引用，再回退到凭据内联代理和全局代理。
+    pub fn effective_proxy_with_pool(
+        &self,
+        global_proxy: Option<&ProxyConfig>,
+        proxy_pool: Option<&ProxyPool>,
+    ) -> Option<ProxyConfig> {
+        if let Some(proxy_id) = self.proxy_id {
+            if let Some(proxy) = proxy_pool.and_then(|pool| pool.to_config(proxy_id)) {
+                return Some(proxy);
+            }
+        }
+        self.effective_proxy(global_proxy)
+    }
+
     pub fn canonicalize_auth_method(&mut self) {
         let auth_method = match &self.auth_method {
             Some(m) => m,
@@ -340,6 +359,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_id: None,
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
@@ -458,6 +478,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_id: None,
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
@@ -489,6 +510,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_id: None,
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
@@ -603,6 +625,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_id: None,
             disabled: false,
             kiro_api_key: None,
             endpoint: None,

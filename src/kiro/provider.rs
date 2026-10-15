@@ -32,8 +32,6 @@ const MAX_TOTAL_RETRIES: usize = 9;
 /// 按凭据 `endpoint` 字段选择 [`KiroEndpoint`] 实现
 pub struct KiroProvider {
     token_manager: Arc<MultiTokenManager>,
-    /// 全局代理配置（用于凭据无自定义代理时的回退）
-    global_proxy: Option<ProxyConfig>,
     /// Client 缓存：key = effective proxy config, value = reqwest::Client
     /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client
     client_cache: Mutex<HashMap<Option<ProxyConfig>, Client>>,
@@ -73,7 +71,6 @@ impl KiroProvider {
 
         Self {
             token_manager,
-            global_proxy: proxy,
             client_cache: Mutex::new(cache),
             tls_backend,
             endpoints,
@@ -83,7 +80,7 @@ impl KiroProvider {
 
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
     fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
-        let effective = credentials.effective_proxy(self.global_proxy.as_ref());
+        let effective = self.token_manager.effective_proxy_for(credentials);
         let mut cache = self.client_cache.lock();
         if let Some(client) = cache.get(&effective) {
             return Ok(client.clone());

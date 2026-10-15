@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2 } from 'lucide-react'
+import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, Settings2 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -22,6 +22,8 @@ import {
   useResetFailure,
   useDeleteCredential,
   useForceRefreshToken,
+  useUpdateCredentialProxy,
+  useProxyProfiles,
 } from '@/hooks/use-credentials'
 
 interface CredentialCardProps {
@@ -60,12 +62,70 @@ export function CredentialCard({
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
+  const [showProxyDialog, setShowProxyDialog] = useState(false)
+  const [proxyUrl, setProxyUrl] = useState('')
+  const [proxyId, setProxyId] = useState('')
+  const [proxyUsername, setProxyUsername] = useState('')
+  const [proxyPassword, setProxyPassword] = useState('')
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
+  const updateProxy = useUpdateCredentialProxy()
+  const { data: proxyProfiles = [] } = useProxyProfiles()
+
+  const openProxyDialog = () => {
+    setProxyUrl(credential.proxyUrl || '')
+    setProxyId(credential.proxyId ? String(credential.proxyId) : '')
+    setProxyUsername('')
+    setProxyPassword('')
+    setShowProxyDialog(true)
+  }
+
+  const handleUpdateProxy = () => {
+    if (!proxyId && !proxyUrl.trim()) {
+      toast.error('请输入代理 URL；如需移除代理请点击“清除代理”')
+      return
+    }
+    updateProxy.mutate(
+      {
+        id: credential.id,
+        request: {
+          proxyId: proxyId ? Number(proxyId) : undefined,
+          proxyUrl: proxyId ? undefined : proxyUrl.trim(),
+          proxyUsername: proxyId ? undefined : proxyUsername.trim() || undefined,
+          // 留空表示保留服务器中已保存的密码
+          proxyPassword: proxyId ? undefined : proxyPassword || undefined,
+        },
+      },
+      {
+        onSuccess: (res) => {
+          toast.success(res.message)
+          setShowProxyDialog(false)
+        },
+        onError: (err) => {
+          toast.error('代理配置更新失败: ' + (err as Error).message)
+        },
+      }
+    )
+  }
+
+  const handleClearProxy = () => {
+    updateProxy.mutate(
+      { id: credential.id, request: { clear: true } },
+      {
+        onSuccess: (res) => {
+          toast.success(res.message)
+          setShowProxyDialog(false)
+        },
+        onError: (err) => {
+          toast.error('代理清除失败: ' + (err as Error).message)
+        },
+      }
+    )
+  }
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -284,7 +344,7 @@ export function CredentialCard({
             {credential.hasProxy && (
               <div className="col-span-2">
                 <span className="text-muted-foreground">代理：</span>
-                <span className="font-medium">{credential.proxyUrl}</span>
+                <span className="font-medium">{credential.proxyName || credential.proxyUrl}</span>
               </div>
             )}
             {credential.hasProfileArn && (
@@ -361,6 +421,14 @@ export function CredentialCard({
             </Button>
             <Button
               size="sm"
+              variant="outline"
+              onClick={openProxyDialog}
+            >
+              <Settings2 className="h-4 w-4 mr-1" />
+              {credential.hasProxy ? '编辑代理' : '设置代理'}
+            </Button>
+            <Button
+              size="sm"
               variant="destructive"
               onClick={() => setShowDeleteDialog(true)}
               disabled={!credential.disabled}
@@ -396,6 +464,111 @@ export function CredentialCard({
               disabled={deleteCredential.isPending || !credential.disabled}
             >
               确认删除
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* 代理配置对话框 */}
+      <Dialog open={showProxyDialog} onOpenChange={setShowProxyDialog}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{credential.hasProxy ? '编辑代理配置' : '设置代理配置'}</DialogTitle>
+            <DialogDescription>
+              代理只对凭据 #{credential.id} 生效，不会修改该凭据的 Token。支持 HTTP、HTTPS、SOCKS5 和 direct。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <label htmlFor={`proxy-profile-${credential.id}`} className="text-sm font-medium">
+                选择代理库
+              </label>
+              <select
+                id={`proxy-profile-${credential.id}`}
+                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                value={proxyId}
+                onChange={(event) => {
+                  setProxyId(event.target.value)
+                  setProxyUrl('')
+                  setProxyUsername('')
+                  setProxyPassword('')
+                }}
+                disabled={updateProxy.isPending}
+              >
+                <option value="">不使用代理库，手动填写</option>
+                {proxyProfiles.map((profile) => (
+                  <option key={profile.id} value={profile.id}>
+                    {profile.name}（{profile.url}）
+                  </option>
+                ))}
+              </select>
+              <p className="text-xs text-muted-foreground">
+                选择后由代理库统一管理，修改代理库会同步影响引用此代理的账号。
+              </p>
+            </div>
+            <div className="space-y-2">
+              <label htmlFor={`proxy-url-${credential.id}`} className="text-sm font-medium">
+                代理 URL
+              </label>
+              <Input
+                id={`proxy-url-${credential.id}`}
+                placeholder="用户名:密码@主机:端口 或 主机:端口:用户名:密码"
+                value={proxyUrl}
+                onChange={(event) => setProxyUrl(event.target.value)}
+                disabled={updateProxy.isPending || Boolean(proxyId)}
+              />
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <div className="space-y-2">
+                <label htmlFor={`proxy-user-${credential.id}`} className="text-sm font-medium">
+                  用户名
+                </label>
+                <Input
+                  id={`proxy-user-${credential.id}`}
+                  placeholder="可选"
+                  value={proxyUsername}
+                  onChange={(event) => setProxyUsername(event.target.value)}
+                  disabled={updateProxy.isPending || Boolean(proxyId)}
+                />
+              </div>
+              <div className="space-y-2">
+                <label htmlFor={`proxy-password-${credential.id}`} className="text-sm font-medium">
+                  密码
+                </label>
+                <Input
+                  id={`proxy-password-${credential.id}`}
+                  type="password"
+                  placeholder="留空保留现有密码"
+                  value={proxyPassword}
+                  onChange={(event) => setProxyPassword(event.target.value)}
+                  disabled={updateProxy.isPending || Boolean(proxyId)}
+                />
+              </div>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="destructive"
+              onClick={handleClearProxy}
+              disabled={updateProxy.isPending || !credential.hasProxy}
+            >
+              清除代理
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setShowProxyDialog(false)}
+              disabled={updateProxy.isPending}
+            >
+              取消
+            </Button>
+            <Button
+              type="button"
+              onClick={handleUpdateProxy}
+              disabled={updateProxy.isPending}
+            >
+              {updateProxy.isPending ? '保存中...' : '保存代理'}
             </Button>
           </DialogFooter>
         </DialogContent>

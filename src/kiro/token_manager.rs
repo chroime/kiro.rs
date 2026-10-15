@@ -23,6 +23,7 @@ use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
+use crate::kiro::proxy_pool::{ProxyPool, parse_proxy_input};
 use crate::model::config::Config;
 
 /// 检查 Token 是否在指定时间内过期
@@ -479,6 +480,11 @@ pub struct CredentialEntrySnapshot {
     /// 代理 URL（用于前端展示）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
+    /// 代理库条目 ID
+    pub proxy_id: Option<u64>,
+    /// 代理库条目名称
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_name: Option<String>,
     /// Token 刷新连续失败次数
     pub refresh_failure_count: u32,
     /// 禁用原因
@@ -520,6 +526,8 @@ pub struct MultiTokenManager {
     credentials_path: Option<PathBuf>,
     /// 是否为多凭据格式（数组格式才回写）
     is_multiple_format: bool,
+    /// 代理库（账号通过 proxy_id 引用）
+    proxy_pool: std::sync::Arc<ProxyPool>,
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
     /// 最近一次统计持久化时间（用于 debounce）
@@ -562,6 +570,25 @@ impl MultiTokenManager {
         proxy: Option<ProxyConfig>,
         credentials_path: Option<PathBuf>,
         is_multiple_format: bool,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_proxy_pool(
+            config,
+            credentials,
+            proxy,
+            credentials_path,
+            is_multiple_format,
+            std::sync::Arc::new(ProxyPool::empty()),
+        )
+    }
+
+    /// 创建带代理库的多凭据 Token 管理器。
+    pub fn new_with_proxy_pool(
+        config: Config,
+        credentials: Vec<KiroCredentials>,
+        proxy: Option<ProxyConfig>,
+        credentials_path: Option<PathBuf>,
+        is_multiple_format: bool,
+        proxy_pool: std::sync::Arc<ProxyPool>,
     ) -> anyhow::Result<Self> {
         // 计算当前最大 ID，为没有 ID 的凭据分配新 ID
         let max_existing_id = credentials.iter().filter_map(|c| c.id).max().unwrap_or(0);
@@ -652,6 +679,7 @@ impl MultiTokenManager {
             refresh_lock: TokioMutex::new(()),
             credentials_path,
             is_multiple_format,
+            proxy_pool,
             load_balancing_mode: Mutex::new(load_balancing_mode),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
@@ -675,6 +703,14 @@ impl MultiTokenManager {
     /// 获取配置的引用
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    pub fn proxy_pool(&self) -> std::sync::Arc<ProxyPool> {
+        self.proxy_pool.clone()
+    }
+
+    pub fn effective_proxy_for(&self, credentials: &KiroCredentials) -> Option<ProxyConfig> {
+        credentials.effective_proxy_with_pool(self.proxy.as_ref(), Some(&self.proxy_pool))
     }
 
     /// 获取凭据总数
@@ -918,7 +954,7 @@ impl MultiTokenManager {
 
             if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                 // 确实需要刷新
-                let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
+                let effective_proxy = self.effective_proxy_for(&current_creds);
                 let new_creds =
                     refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
 
@@ -970,21 +1006,17 @@ impl MultiTokenManager {
 
     /// 将凭据列表回写到源文件
     ///
-    /// 仅在以下条件满足时回写：
-    /// - 源文件是多凭据格式（数组）
-    /// - credentials_path 已设置
+    /// 在源文件路径存在时回写，并保持原始凭据文件形状：
+    /// - 多凭据格式继续写回数组
+    /// - 单凭据格式写回单个对象
+    /// - credentials_path 未设置时跳过
     ///
     /// # Returns
     /// - `Ok(true)` - 成功写入文件
-    /// - `Ok(false)` - 跳过写入（非多凭据格式或无路径配置）
+    /// - `Ok(false)` - 跳过写入（无路径配置）
     /// - `Err(_)` - 写入失败
     fn persist_credentials(&self) -> anyhow::Result<bool> {
         use anyhow::Context;
-
-        // 仅多凭据格式才回写
-        if !self.is_multiple_format {
-            return Ok(false);
-        }
 
         let path = match &self.credentials_path {
             Some(p) => p,
@@ -1006,8 +1038,21 @@ impl MultiTokenManager {
                 .collect()
         };
 
-        // 序列化为 pretty JSON
-        let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
+        // 单对象格式只能安全回写一个凭据；添加/删除导致数量变化时保留
+        // 旧行为，避免把新凭据静默截断或把空数组写成错误形状。
+        if !self.is_multiple_format && credentials.len() != 1 {
+            return Ok(false);
+        }
+
+        // 序列化为 pretty JSON，同时保持原始单对象/数组形状。
+        let json = if self.is_multiple_format {
+            serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?
+        } else {
+            let credential = credentials
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("单凭据文件没有可写回的凭据"))?;
+            serde_json::to_string_pretty(credential).context("序列化凭据失败")?
+        };
 
         // 写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
         if tokio::runtime::Handle::try_current().is_ok() {
@@ -1442,8 +1487,17 @@ impl MultiTokenManager {
                     email: e.credentials.email.clone(),
                     success_count: e.success_count,
                     last_used_at: e.last_used_at.clone(),
-                    has_proxy: e.credentials.proxy_url.is_some(),
-                    proxy_url: e.credentials.proxy_url.clone(),
+                    has_proxy: e.credentials.proxy_id.is_some() || e.credentials.proxy_url.is_some(),
+                    proxy_url: e
+                        .credentials
+                        .proxy_id
+                        .and_then(|id| self.proxy_pool.get(id).map(|proxy| proxy.url))
+                        .or_else(|| e.credentials.proxy_url.clone()),
+                    proxy_id: e.credentials.proxy_id,
+                    proxy_name: e
+                        .credentials
+                        .proxy_id
+                        .and_then(|id| self.proxy_pool.get(id).map(|proxy| proxy.name)),
                     refresh_failure_count: e.refresh_failure_count,
                     disabled_reason: e.disabled_reason.map(|r| match r {
                         DisabledReason::Manual => "Manual",
@@ -1505,6 +1559,79 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 更新指定凭据的代理配置（Admin API）。
+    ///
+    /// 代理配置与 OAuth/API Key 凭据本身是相互独立的；此方法只修改代理
+    /// 字段，确保 refresh/access token、优先级和禁用状态保持不变。
+    pub fn update_proxy(
+        &self,
+        id: u64,
+        proxy_id: Option<u64>,
+        proxy_url: Option<String>,
+        proxy_username: Option<String>,
+        proxy_password: Option<String>,
+        clear: bool,
+    ) -> anyhow::Result<()> {
+        let mut entries = self.entries.lock();
+        let entry = entries
+            .iter_mut()
+            .find(|e| e.id == id)
+            .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+
+        if clear {
+            entry.credentials.proxy_url = None;
+            entry.credentials.proxy_username = None;
+            entry.credentials.proxy_password = None;
+            entry.credentials.proxy_id = None;
+        } else if let Some(proxy_id) = proxy_id {
+            if !self.proxy_pool.contains(proxy_id) {
+                anyhow::bail!("代理不存在: {}", proxy_id);
+            }
+            entry.credentials.proxy_id = Some(proxy_id);
+            entry.credentials.proxy_url = None;
+            entry.credentials.proxy_username = None;
+            entry.credentials.proxy_password = None;
+        } else {
+            if let Some(url) = proxy_url {
+                let url = url.trim().to_string();
+                if url.is_empty() {
+                    anyhow::bail!("代理 URL 不能为空；如需移除代理请使用 clear=true");
+                }
+                if !url.eq_ignore_ascii_case(KiroCredentials::PROXY_DIRECT) {
+                    let parsed = parse_proxy_input(&url)
+                        .map_err(|e| anyhow::anyhow!("代理地址无效: {e}"))?;
+                    entry.credentials.proxy_url = Some(parsed.url);
+                    if proxy_username.is_none() && parsed.username.is_some() {
+                        entry.credentials.proxy_username = parsed.username;
+                    }
+                    if proxy_password.is_none() && parsed.password.is_some() {
+                        entry.credentials.proxy_password = parsed.password;
+                    }
+                } else {
+                    entry.credentials.proxy_url = Some(KiroCredentials::PROXY_DIRECT.to_string());
+                }
+                entry.credentials.proxy_id = None;
+            }
+            // 未提供用户名时保留原值；空密码也保留原值，避免编辑 URL 时意外丢失认证。
+            if let Some(username) = proxy_username {
+                entry.credentials.proxy_username = if username.trim().is_empty() {
+                    None
+                } else {
+                    Some(username)
+                };
+            }
+            if let Some(password) = proxy_password {
+                if !password.is_empty() {
+                    entry.credentials.proxy_password = Some(password);
+                }
+            }
+        }
+        drop(entries);
+
+        self.persist_credentials()?;
+        Ok(())
+    }
+
     /// 重置凭据失败计数并重新启用（Admin API）
     pub fn reset_and_enable(&self, id: u64) -> anyhow::Result<()> {
         {
@@ -1527,6 +1654,16 @@ impl MultiTokenManager {
         // 持久化更改
         self.persist_credentials()?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn credentials_for_test(&self, id: u64) -> anyhow::Result<KiroCredentials> {
+        self.entries
+            .lock()
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.credentials.clone())
+            .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))
     }
 
     /// 获取指定凭据的使用额度（Admin API）
@@ -1563,7 +1700,7 @@ impl MultiTokenManager {
                 };
 
                 if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
-                    let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
+                    let effective_proxy = self.effective_proxy_for(&current_creds);
                     let new_creds =
                         refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
                             .await?;
@@ -1601,7 +1738,7 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
 
-        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+        let effective_proxy = self.effective_proxy_for(&credentials);
         let usage_limits = get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
 
         // 更新订阅等级到凭据（仅在发生变化时持久化）
@@ -1714,7 +1851,7 @@ impl MultiTokenManager {
         let mut validated_cred = if new_cred.is_api_key_credential() {
             new_cred.clone()
         } else {
-            let effective_proxy = new_cred.effective_proxy(self.proxy.as_ref());
+            let effective_proxy = self.effective_proxy_for(&new_cred);
             refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?
         };
 
@@ -1851,7 +1988,7 @@ impl MultiTokenManager {
         let _guard = self.refresh_lock.lock().await;
 
         // 无条件调用 refresh_token
-        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+        let effective_proxy = self.effective_proxy_for(&credentials);
         let new_creds =
             refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?;
 
@@ -2132,6 +2269,153 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(manager.total_count(), 2);
         assert_eq!(manager.available_count(), 2);
+    }
+
+    #[test]
+    fn test_update_proxy_preserves_credential_tokens() {
+        let config = Config::default();
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(7);
+        credential.refresh_token = Some("refresh-token-that-must-remain".to_string());
+        credential.access_token = Some("access-token-that-must-remain".to_string());
+        let manager = MultiTokenManager::new(config, vec![credential], None, None, false).unwrap();
+
+        manager
+            .update_proxy(
+                7,
+                None,
+                Some("socks5://proxy.example:1080".to_string()),
+                Some("proxy-user".to_string()),
+                Some("proxy-pass".to_string()),
+                false,
+            )
+            .unwrap();
+
+        let entry = manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == 7)
+            .unwrap();
+        assert_eq!(entry.proxy_url.as_deref(), Some("socks5://proxy.example:1080"));
+
+        let credentials = manager.credentials_for_test(7).unwrap();
+        assert_eq!(credentials.refresh_token.as_deref(), Some("refresh-token-that-must-remain"));
+        assert_eq!(credentials.access_token.as_deref(), Some("access-token-that-must-remain"));
+        assert_eq!(credentials.proxy_username.as_deref(), Some("proxy-user"));
+        assert_eq!(credentials.proxy_password.as_deref(), Some("proxy-pass"));
+    }
+
+    #[test]
+    fn test_update_proxy_accepts_short_proxy_formats() {
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(10);
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![credential],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        manager
+            .update_proxy(
+                10,
+                None,
+                Some("user:pass@127.0.0.1:8080".to_string()),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+
+        let credentials = manager.credentials_for_test(10).unwrap();
+        assert_eq!(credentials.proxy_url.as_deref(), Some("http://127.0.0.1:8080"));
+        assert_eq!(credentials.proxy_username.as_deref(), Some("user"));
+        assert_eq!(credentials.proxy_password.as_deref(), Some("pass"));
+    }
+
+    #[test]
+    fn test_update_proxy_persists_single_credential_file() {
+        let path = std::env::temp_dir().join(format!("kiro-single-cred-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&path, r#"{"id":11,"refreshToken":"refresh-token"}"#).unwrap();
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(11);
+        credential.refresh_token = Some("refresh-token".to_string());
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![credential],
+            None,
+            Some(path.clone()),
+            false,
+        )
+        .unwrap();
+
+        manager
+            .update_proxy(
+                11,
+                None,
+                Some("127.0.0.1:8080:user:pass".to_string()),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+
+        let persisted: KiroCredentials = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(persisted.proxy_url.as_deref(), Some("http://127.0.0.1:8080"));
+        assert_eq!(persisted.proxy_username.as_deref(), Some("user"));
+        assert_eq!(persisted.proxy_password.as_deref(), Some("pass"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_update_proxy_clear_removes_proxy_and_credentials() {
+        let config = Config::default();
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(8);
+        credential.proxy_url = Some("http://proxy.example:8080".to_string());
+        credential.proxy_username = Some("user".to_string());
+        credential.proxy_password = Some("pass".to_string());
+        let manager = MultiTokenManager::new(config, vec![credential], None, None, false).unwrap();
+
+        manager.update_proxy(8, None, None, None, None, true).unwrap();
+
+        let credentials = manager.credentials_for_test(8).unwrap();
+        assert!(credentials.proxy_url.is_none());
+        assert!(credentials.proxy_username.is_none());
+        assert!(credentials.proxy_password.is_none());
+    }
+
+    #[test]
+    fn test_proxy_pool_reference_is_resolved_for_requests() {
+        let pool = crate::kiro::proxy_pool::ProxyPool::in_memory();
+        let proxy_id = pool
+            .add(
+                "测试代理".to_string(),
+                "pool-user:pool-pass@127.0.0.1:8080".to_string(),
+            )
+            .unwrap();
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(9);
+        credential.proxy_id = Some(proxy_id);
+        let manager = MultiTokenManager::new_with_proxy_pool(
+            Config::default(),
+            vec![credential],
+            None,
+            None,
+            false,
+            pool,
+        )
+        .unwrap();
+
+        let proxy = manager
+            .effective_proxy_for(&manager.credentials_for_test(9).unwrap())
+            .unwrap();
+        assert_eq!(proxy.url, "http://127.0.0.1:8080");
+        assert_eq!(proxy.username.as_deref(), Some("pool-user"));
+        assert_eq!(proxy.password.as_deref(), Some("pool-pass"));
     }
 
     // MultiTokenManager 测试

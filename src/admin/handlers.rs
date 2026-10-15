@@ -9,8 +9,9 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse,
+        AddCredentialRequest, AddProxyResponse, CreateProxyRequest, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse, UpdateProxyProfileRequest,
+        UpdateProxyRequest,
     },
 };
 
@@ -50,6 +51,67 @@ pub async fn set_credential_priority(
             id, payload.priority
         )))
         .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// PATCH /api/admin/credentials/:id/proxy
+/// 更新或清除凭据级代理配置
+pub async fn update_credential_proxy(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<UpdateProxyRequest>,
+) -> impl IntoResponse {
+    match state.service.update_proxy(id, payload) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 代理配置已更新", id)))
+            .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/proxies
+pub async fn get_proxies(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_proxies())
+}
+
+/// POST /api/admin/proxies
+pub async fn add_proxy(
+    State(state): State<AdminState>,
+    Json(payload): Json<CreateProxyRequest>,
+) -> impl IntoResponse {
+    match state.service.add_proxy(payload.name, payload.proxy) {
+        Ok(proxy_id) => Json(AddProxyResponse {
+            success: true,
+            message: format!("代理已添加，ID: {}", proxy_id),
+            proxy_id,
+        })
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// PATCH /api/admin/proxies/:id
+pub async fn update_proxy_profile(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<UpdateProxyProfileRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .update_proxy_profile(id, payload.name, payload.proxy, payload.username, payload.password)
+    {
+        Ok(_) => Json(SuccessResponse::new(format!("代理 #{} 已更新", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// DELETE /api/admin/proxies/:id
+pub async fn delete_proxy(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.delete_proxy(id) {
+        Ok(_) => Json(SuccessResponse::new(format!("代理 #{} 已删除", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

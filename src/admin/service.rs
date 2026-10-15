@@ -9,12 +9,14 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::proxy_pool::ProxyProfileStatus;
 use crate::kiro::token_manager::MultiTokenManager;
 
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
     CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
+    UpdateProxyRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -84,6 +86,8 @@ impl AdminService {
                 last_used_at: entry.last_used_at.clone(),
                 has_proxy: entry.has_proxy,
                 proxy_url: entry.proxy_url,
+                proxy_id: entry.proxy_id,
+                proxy_name: entry.proxy_name,
                 refresh_failure_count: entry.refresh_failure_count,
                 disabled_reason: entry.disabled_reason,
                 endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
@@ -123,6 +127,68 @@ impl AdminService {
         self.token_manager
             .set_priority(id, priority)
             .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 更新指定凭据的代理配置。
+    pub fn update_proxy(
+        &self,
+        id: u64,
+        req: UpdateProxyRequest,
+    ) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .update_proxy(
+                id,
+                req.proxy_id,
+                req.proxy_url,
+                req.proxy_username,
+                req.proxy_password,
+                req.clear,
+            )
+            .map_err(|e| self.classify_proxy_error(e, id))
+    }
+
+    pub fn get_proxies(&self) -> Vec<ProxyProfileStatus> {
+        self.token_manager.proxy_pool().status()
+    }
+
+    pub fn add_proxy(&self, name: String, proxy: String) -> Result<u64, AdminServiceError> {
+        self.token_manager
+            .proxy_pool()
+            .add(name, proxy)
+            .map_err(|e| self.classify_proxy_pool_error(e))
+    }
+
+    pub fn update_proxy_profile(
+        &self,
+        id: u64,
+        name: String,
+        proxy: String,
+        username: Option<String>,
+        password: Option<String>,
+    ) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .proxy_pool()
+            .update(id, name, proxy, username, password)
+            .map_err(|e| self.classify_proxy_pool_error(e))
+    }
+
+    pub fn delete_proxy(&self, id: u64) -> Result<(), AdminServiceError> {
+        let in_use = self
+            .token_manager
+            .snapshot()
+            .entries
+            .iter()
+            .any(|entry| entry.proxy_id == Some(id));
+        if in_use {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "代理 #{} 正被凭据引用，请先切换这些凭据的代理",
+                id
+            )));
+        }
+        self.token_manager
+            .proxy_pool()
+            .remove(id)
+            .map_err(|e| self.classify_proxy_pool_error(e))
     }
 
     /// 重置失败计数并重新启用
@@ -232,6 +298,7 @@ impl AdminService {
             proxy_url: req.proxy_url,
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
+            proxy_id: None,
             disabled: false, // 新添加的凭据默认启用
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
@@ -374,6 +441,21 @@ impl AdminService {
         } else {
             AdminServiceError::InternalError(msg)
         }
+    }
+
+    fn classify_proxy_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
+        let msg = e.to_string();
+        if msg.contains("凭据不存在") {
+            AdminServiceError::NotFound { id }
+        } else if msg.contains("代理 URL") {
+            AdminServiceError::InvalidCredential(msg)
+        } else {
+            AdminServiceError::InternalError(msg)
+        }
+    }
+
+    fn classify_proxy_pool_error(&self, e: anyhow::Error) -> AdminServiceError {
+        AdminServiceError::InvalidCredential(e.to_string())
     }
 
     /// 分类余额查询错误（可能涉及上游 API 调用）

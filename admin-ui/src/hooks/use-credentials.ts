@@ -3,6 +3,11 @@ import {
   getCredentials,
   setCredentialDisabled,
   setCredentialPriority,
+  updateCredentialProxy,
+  getProxyProfiles,
+  addProxyProfile,
+  updateProxyProfile,
+  deleteProxyProfile,
   resetCredentialFailure,
   forceRefreshToken,
   getCredentialBalance,
@@ -11,7 +16,12 @@ import {
   getLoadBalancingMode,
   setLoadBalancingMode,
 } from '@/api/credentials'
-import type { AddCredentialRequest } from '@/types/api'
+import type {
+  AddCredentialRequest,
+  CreateProxyRequest,
+  UpdateProxyProfileRequest,
+  UpdateProxyRequest,
+} from '@/types/api'
 
 // 查询凭据列表
 export function useCredentials() {
@@ -51,6 +61,53 @@ export function useSetPriority() {
     mutationFn: ({ id, priority }: { id: number; priority: number }) =>
       setCredentialPriority(id, priority),
     onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 更新或清除凭据级代理配置
+export function useUpdateCredentialProxy() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, request }: { id: number; request: UpdateProxyRequest }) =>
+      updateCredentialProxy(id, request),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+export function useProxyProfiles() {
+  return useQuery({
+    queryKey: ['proxyProfiles'],
+    queryFn: getProxyProfiles,
+  })
+}
+
+export function useAddProxyProfile() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (req: CreateProxyRequest) => addProxyProfile(req),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['proxyProfiles'] }),
+  })
+}
+
+export function useUpdateProxyProfile() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, request }: { id: number; request: UpdateProxyProfileRequest }) =>
+      updateProxyProfile(id, request),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['proxyProfiles'] }),
+  })
+}
+
+export function useDeleteProxyProfile() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => deleteProxyProfile(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['proxyProfiles'] })
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
   })
