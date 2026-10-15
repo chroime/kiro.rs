@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Pencil, Plus, Trash2 } from 'lucide-react'
+import { Gauge, MapPin, Pencil, Plus, RefreshCw, Trash2, Wifi } from 'lucide-react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -16,8 +16,9 @@ import {
   useDeleteProxyProfile,
   useProxyProfiles,
   useUpdateProxyProfile,
+  useTestProxyProfile,
 } from '@/hooks/use-credentials'
-import type { ProxyProfileStatus } from '@/types/api'
+import type { ProxyProfileStatus, ProxyTestResponse } from '@/types/api'
 
 interface ProxyPoolDialogProps {
   open: boolean
@@ -29,11 +30,14 @@ export function ProxyPoolDialog({ open, onOpenChange }: ProxyPoolDialogProps) {
   const addProxy = useAddProxyProfile()
   const updateProxy = useUpdateProxyProfile()
   const deleteProxy = useDeleteProxyProfile()
+  const testProxy = useTestProxyProfile()
   const [editing, setEditing] = useState<ProxyProfileStatus | null>(null)
   const [name, setName] = useState('')
   const [proxyInput, setProxyInput] = useState('')
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
+  const [testResults, setTestResults] = useState<Record<number, ProxyTestResponse>>({})
+  const [testingId, setTestingId] = useState<number | null>(null)
 
   useEffect(() => {
     if (!open) {
@@ -120,8 +124,31 @@ export function ProxyPoolDialog({ open, onOpenChange }: ProxyPoolDialogProps) {
   const handleDelete = (profile: ProxyProfileStatus) => {
     if (!confirm(`确定删除代理“${profile.name}”吗？正在使用它的账号会阻止删除。`)) return
     deleteProxy.mutate(profile.id, {
-      onSuccess: (response) => toast.success(response.message),
+      onSuccess: (response) => {
+        toast.success(response.message)
+        setTestResults((current) => {
+          const next = { ...current }
+          delete next[profile.id]
+          return next
+        })
+      },
       onError: (error) => toast.error('代理删除失败: ' + (error as Error).message),
+    })
+  }
+
+  const handleTest = (profile: ProxyProfileStatus) => {
+    setTestingId(profile.id)
+    testProxy.mutate(profile.id, {
+      onSuccess: (response) => {
+        setTestResults((current) => ({ ...current, [profile.id]: response }))
+        if (response.success) {
+          toast.success(`${profile.name}：${response.message}`)
+        } else {
+          toast.error(`${profile.name}：${response.message}`)
+        }
+      },
+      onError: (error) => toast.error('代理测试失败: ' + (error as Error).message),
+      onSettled: () => setTestingId(null),
     })
   }
 
@@ -143,24 +170,50 @@ export function ProxyPoolDialog({ open, onOpenChange }: ProxyPoolDialogProps) {
           ) : profiles.length === 0 ? (
             <p className="text-sm text-muted-foreground">还没有代理，请在下方添加。</p>
           ) : (
-            profiles.map((profile) => (
-              <div key={profile.id} className="flex items-center justify-between gap-3 rounded-md border p-3">
-                <div className="min-w-0">
-                  <div className="font-medium truncate">{profile.name}</div>
-                  <div className="text-xs text-muted-foreground truncate">
-                    {profile.url}{profile.username ? ` · ${profile.username}` : ''}{profile.hasPassword ? ' · 已设置密码' : ''}
+            profiles.map((profile) => {
+              const result = testResults[profile.id]
+              const isTesting = testingId === profile.id
+              const location = [result?.countryCode || result?.country, result?.region, result?.city]
+                .filter(Boolean)
+                .join(' · ')
+              return (
+                <div key={profile.id} className="rounded-md border p-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="font-medium truncate">{profile.name}</div>
+                      <div className="text-xs text-muted-foreground truncate">
+                        {profile.url}{profile.username ? ` · ${profile.username}` : ''}{profile.hasPassword ? ' · 已设置密码' : ''}
+                      </div>
+                    </div>
+                    <div className="flex shrink-0 gap-2">
+                      <Button size="sm" variant="outline" onClick={() => handleTest(profile)} disabled={pending || testingId !== null}>
+                        {isTesting ? <RefreshCw className="h-4 w-4 mr-1 animate-spin" /> : <Wifi className="h-4 w-4 mr-1" />}
+                        {isTesting ? '测试中' : '测试'}
+                      </Button>
+                      <Button size="sm" variant="outline" onClick={() => startEdit(profile)} disabled={pending || testingId !== null}>
+                        <Pencil className="h-4 w-4 mr-1" />编辑
+                      </Button>
+                      <Button size="sm" variant="destructive" onClick={() => handleDelete(profile)} disabled={pending || testingId !== null}>
+                        <Trash2 className="h-4 w-4 mr-1" />删除
+                      </Button>
+                    </div>
                   </div>
+                  {result && (
+                    <div className={`mt-2 rounded border px-2 py-1.5 text-xs ${result.success ? 'border-green-200 bg-green-50 text-green-800 dark:border-green-900 dark:bg-green-950 dark:text-green-200' : 'border-red-200 bg-red-50 text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200'}`}>
+                      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                        <span className="font-medium">{result.success ? '可用' : '不可用'}</span>
+                        {result.latencyMs != null && <span className="inline-flex items-center gap-1"><Gauge className="h-3.5 w-3.5" />{result.latencyMs} ms</span>}
+                        {result.ipAddress && <span>出口 IP：{result.ipAddress}</span>}
+                        {location && <span className="inline-flex items-center gap-1"><MapPin className="h-3.5 w-3.5" />{location}</span>}
+                        {result.success && !location && <span>位置未知</span>}
+                      </div>
+                      {result.locationError && <div className="mt-1 opacity-80">{result.locationError}</div>}
+                      {!result.success && <div className="mt-1">{result.message}</div>}
+                    </div>
+                  )}
                 </div>
-                <div className="flex shrink-0 gap-2">
-                  <Button size="sm" variant="outline" onClick={() => startEdit(profile)} disabled={pending}>
-                    <Pencil className="h-4 w-4 mr-1" />编辑
-                  </Button>
-                  <Button size="sm" variant="destructive" onClick={() => handleDelete(profile)} disabled={pending}>
-                    <Trash2 className="h-4 w-4 mr-1" />删除
-                  </Button>
-                </div>
-              </div>
-            ))
+              )
+            })
           )}
         </div>
 

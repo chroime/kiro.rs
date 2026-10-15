@@ -82,6 +82,19 @@ export interface ProxyProfileStatus {
   hasPassword: boolean
 }
 
+export interface ProxyTestResponse {
+  proxyId: number
+  success: boolean
+  latencyMs?: number
+  ipAddress?: string
+  country?: string
+  countryCode?: string
+  region?: string
+  city?: string
+  locationError?: string
+  message: string
+}
+
 export interface CreateProxyRequest {
   name: string
   proxy: string

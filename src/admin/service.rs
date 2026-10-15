@@ -3,11 +3,13 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+use crate::http_client::build_client;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::proxy_pool::ProxyProfileStatus;
 use crate::kiro::token_manager::MultiTokenManager;
@@ -15,12 +17,14 @@ use crate::kiro::token_manager::MultiTokenManager;
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
-    UpdateProxyRequest,
+    CredentialsStatusResponse, LoadBalancingModeResponse, ProxyTestResponse,
+    SetLoadBalancingModeRequest, UpdateProxyRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
+const PROXY_TEST_TIMEOUT_SECS: u64 = 15;
+const PROXY_LOCATION_TIMEOUT_SECS: u64 = 5;
 
 /// 缓存的余额条目（含时间戳）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,11 +134,7 @@ impl AdminService {
     }
 
     /// 更新指定凭据的代理配置。
-    pub fn update_proxy(
-        &self,
-        id: u64,
-        req: UpdateProxyRequest,
-    ) -> Result<(), AdminServiceError> {
+    pub fn update_proxy(&self, id: u64, req: UpdateProxyRequest) -> Result<(), AdminServiceError> {
         self.token_manager
             .update_proxy(
                 id,
@@ -149,6 +149,129 @@ impl AdminService {
 
     pub fn get_proxies(&self) -> Vec<ProxyProfileStatus> {
         self.token_manager.proxy_pool().status()
+    }
+
+    /// 使用指定代理请求公网回显服务，测量延迟并查询出口 IP 位置。
+    ///
+    /// 地理位置服务是辅助信息：即使查询失败，只要公网回显成功，代理仍判定为可用。
+    /// 测试不修改代理库，也不记录或返回代理认证信息。
+    pub async fn test_proxy(&self, id: u64) -> Result<ProxyTestResponse, AdminServiceError> {
+        let proxy = self
+            .token_manager
+            .proxy_pool()
+            .to_config(id)
+            .ok_or(AdminServiceError::NotFound { id })?;
+
+        let client = match build_client(
+            Some(&proxy),
+            PROXY_TEST_TIMEOUT_SECS,
+            self.token_manager.config().tls_backend,
+        ) {
+            Ok(client) => client,
+            Err(error) => {
+                return Ok(ProxyTestResponse {
+                    proxy_id: id,
+                    success: false,
+                    latency_ms: None,
+                    ip_address: None,
+                    country: None,
+                    country_code: None,
+                    region: None,
+                    city: None,
+                    location_error: None,
+                    message: format!("代理连接失败：{}", safe_network_error(&error)),
+                });
+            }
+        };
+
+        let started = Instant::now();
+        let ip_response = match client.get("https://api.ipify.org?format=json").send().await {
+            Ok(response) => response,
+            Err(error) => {
+                return Ok(proxy_test_failure(id, &error));
+            }
+        };
+        let status = ip_response.status();
+        let body = match ip_response.text().await {
+            Ok(body) => body,
+            Err(error) => {
+                return Ok(proxy_test_failure(id, &error));
+            }
+        };
+        let latency_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        if !status.is_success() {
+            return Ok(ProxyTestResponse {
+                proxy_id: id,
+                success: false,
+                latency_ms: Some(latency_ms),
+                ip_address: None,
+                country: None,
+                country_code: None,
+                region: None,
+                city: None,
+                location_error: None,
+                message: format!("代理连接失败：IP 回显服务返回 HTTP {}", status.as_u16()),
+            });
+        }
+
+        let ip_address = match serde_json::from_str::<IpifyResponse>(&body)
+            .ok()
+            .and_then(|response| normalize_ip(&response.ip))
+        {
+            Some(ip) => ip,
+            None => {
+                return Ok(ProxyTestResponse {
+                    proxy_id: id,
+                    success: false,
+                    latency_ms: Some(latency_ms),
+                    ip_address: None,
+                    country: None,
+                    country_code: None,
+                    region: None,
+                    city: None,
+                    location_error: None,
+                    message: "代理连接失败：IP 回显服务返回了无效地址".to_string(),
+                });
+            }
+        };
+
+        let location = match tokio::time::timeout(
+            Duration::from_secs(PROXY_LOCATION_TIMEOUT_SECS),
+            fetch_ip_location(&client, &ip_address),
+        )
+        .await
+        {
+            Ok(location) => location,
+            Err(_) => Err(anyhow::anyhow!("地理位置查询超时")),
+        };
+        let (country, country_code, region, city, location_error) = match location {
+            Ok(location) => (
+                location.country,
+                location.country_code,
+                location.region,
+                location.city,
+                None,
+            ),
+            Err(error) => (None, None, None, None, Some(safe_network_error(&error))),
+        };
+        let message = if location_error.is_some() {
+            "代理连接正常；IP 地理位置查询失败".to_string()
+        } else {
+            "代理连接正常".to_string()
+        };
+
+        Ok(ProxyTestResponse {
+            proxy_id: id,
+            success: true,
+            latency_ms: Some(latency_ms),
+            ip_address: Some(ip_address),
+            country,
+            country_code,
+            region,
+            city,
+            location_error,
+            message,
+        })
     }
 
     pub fn add_proxy(&self, name: String, proxy: String) -> Result<u64, AdminServiceError> {
@@ -530,10 +653,102 @@ impl AdminService {
         let msg = e.to_string();
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
-        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据") {
+        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据")
+        {
             AdminServiceError::InvalidCredential(msg)
         } else {
             AdminServiceError::InternalError(msg)
         }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct IpifyResponse {
+    ip: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct IpWhoIsResponse {
+    success: Option<bool>,
+    country: Option<String>,
+    country_code: Option<String>,
+    region: Option<String>,
+    city: Option<String>,
+    message: Option<String>,
+}
+
+#[derive(Debug)]
+struct IpLocation {
+    country: Option<String>,
+    country_code: Option<String>,
+    region: Option<String>,
+    city: Option<String>,
+}
+
+async fn fetch_ip_location(client: &reqwest::Client, ip: &str) -> anyhow::Result<IpLocation> {
+    let response = client
+        .get(format!("https://ipwho.is/{}", ip))
+        .send()
+        .await?;
+    let status = response.status();
+    let location = response.json::<IpWhoIsResponse>().await?;
+    if !status.is_success() || location.success == Some(false) {
+        anyhow::bail!(
+            "地理位置服务返回 HTTP {}{}",
+            status.as_u16(),
+            location
+                .message
+                .as_deref()
+                .map(|message| format!("：{}", message))
+                .unwrap_or_default()
+        );
+    }
+    Ok(IpLocation {
+        country: location.country,
+        country_code: location.country_code,
+        region: location.region,
+        city: location.city,
+    })
+}
+
+fn normalize_ip(value: &str) -> Option<String> {
+    let ip = value.trim();
+    if ip.parse::<std::net::IpAddr>().is_ok() {
+        Some(ip.to_string())
+    } else {
+        None
+    }
+}
+
+fn proxy_test_failure(id: u64, error: &reqwest::Error) -> ProxyTestResponse {
+    let kind = if error.is_timeout() {
+        "请求超时"
+    } else if error.is_connect() {
+        "无法建立连接"
+    } else {
+        "网络请求失败"
+    };
+    ProxyTestResponse {
+        proxy_id: id,
+        success: false,
+        latency_ms: None,
+        ip_address: None,
+        country: None,
+        country_code: None,
+        region: None,
+        city: None,
+        location_error: None,
+        message: format!("代理连接失败：{}", kind),
+    }
+}
+
+fn safe_network_error(error: &anyhow::Error) -> String {
+    let message = error.to_string().to_ascii_lowercase();
+    if message.contains("timed out") || message.contains("timeout") {
+        "请求超时".to_string()
+    } else if message.contains("connect") {
+        "无法建立连接".to_string()
+    } else {
+        "网络请求失败".to_string()
     }
 }

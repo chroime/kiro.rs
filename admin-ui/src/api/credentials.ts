@@ -13,6 +13,7 @@ import type {
   CreateProxyRequest,
   UpdateProxyProfileRequest,
   AddProxyResponse,
+  ProxyTestResponse,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -94,6 +95,11 @@ export async function updateProxyProfile(
 
 export async function deleteProxyProfile(id: number): Promise<SuccessResponse> {
   const { data } = await api.delete<SuccessResponse>(`/proxies/${id}`)
+  return data
+}
+
+export async function testProxyProfile(id: number): Promise<ProxyTestResponse> {
+  const { data } = await api.post<ProxyTestResponse>(`/proxies/${id}/test`)
   return data
 }
 

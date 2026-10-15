@@ -132,6 +132,24 @@ pub struct AddProxyResponse {
     pub proxy_id: u64,
 }
 
+/// 代理连通性与出口位置测试结果。
+///
+/// 测试结果只描述本次请求，不会写入代理库配置；认证信息也不会出现在响应中。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyTestResponse {
+    pub proxy_id: u64,
+    pub success: bool,
+    pub latency_ms: Option<u64>,
+    pub ip_address: Option<String>,
+    pub country: Option<String>,
+    pub country_code: Option<String>,
+    pub region: Option<String>,
+    pub city: Option<String>,
+    pub location_error: Option<String>,
+    pub message: String,
+}
+
 /// 添加凭据请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

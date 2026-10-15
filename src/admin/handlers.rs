@@ -10,8 +10,8 @@ use super::{
     middleware::AdminState,
     types::{
         AddCredentialRequest, AddProxyResponse, CreateProxyRequest, SetDisabledRequest,
-        SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse, UpdateProxyProfileRequest,
-        UpdateProxyRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse,
+        UpdateProxyProfileRequest, UpdateProxyRequest,
     },
 };
 
@@ -63,8 +63,7 @@ pub async fn update_credential_proxy(
     Json(payload): Json<UpdateProxyRequest>,
 ) -> impl IntoResponse {
     match state.service.update_proxy(id, payload) {
-        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 代理配置已更新", id)))
-            .into_response(),
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 代理配置已更新", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -72,6 +71,14 @@ pub async fn update_credential_proxy(
 /// GET /api/admin/proxies
 pub async fn get_proxies(State(state): State<AdminState>) -> impl IntoResponse {
     Json(state.service.get_proxies())
+}
+
+/// POST /api/admin/proxies/:id/test
+pub async fn test_proxy(State(state): State<AdminState>, Path(id): Path<u64>) -> impl IntoResponse {
+    match state.service.test_proxy(id).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
 }
 
 /// POST /api/admin/proxies
@@ -96,10 +103,13 @@ pub async fn update_proxy_profile(
     Path(id): Path<u64>,
     Json(payload): Json<UpdateProxyProfileRequest>,
 ) -> impl IntoResponse {
-    match state
-        .service
-        .update_proxy_profile(id, payload.name, payload.proxy, payload.username, payload.password)
-    {
+    match state.service.update_proxy_profile(
+        id,
+        payload.name,
+        payload.proxy,
+        payload.username,
+        payload.password,
+    ) {
         Ok(_) => Json(SuccessResponse::new(format!("代理 #{} 已更新", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

@@ -8,6 +8,7 @@ import {
   addProxyProfile,
   updateProxyProfile,
   deleteProxyProfile,
+  testProxyProfile,
   resetCredentialFailure,
   forceRefreshToken,
   getCredentialBalance,
@@ -110,6 +111,12 @@ export function useDeleteProxyProfile() {
       queryClient.invalidateQueries({ queryKey: ['proxyProfiles'] })
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
+  })
+}
+
+export function useTestProxyProfile() {
+  return useMutation({
+    mutationFn: (id: number) => testProxyProfile(id),
   })
 }
 
