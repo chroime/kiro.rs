@@ -2,7 +2,7 @@
 //!
 //! 实现 Kiro → Anthropic 流式响应转换和 SSE 状态管理
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use serde_json::json;
 use uuid::Uuid;
@@ -453,11 +453,12 @@ impl SseStateManager {
         None
     }
 
-    /// 生成最终事件序列
-    pub fn generate_final_events(
+    /// 生成带缓存 usage 的最终事件序列。
+    pub fn generate_final_events_with_cache(
         &mut self,
         input_tokens: i32,
         output_tokens: i32,
+        cache_usage: CacheUsage,
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
@@ -488,7 +489,9 @@ impl SseStateManager {
                     },
                     "usage": {
                         "input_tokens": input_tokens,
-                        "output_tokens": output_tokens
+                        "output_tokens": output_tokens,
+                        "cache_creation_input_tokens": cache_usage.cache_creation_input_tokens,
+                        "cache_read_input_tokens": cache_usage.cache_read_input_tokens
                     }
                 }),
             ));
@@ -507,8 +510,8 @@ impl SseStateManager {
     }
 }
 
+use super::cache::{CacheUsage, VirtualInputCache};
 use super::converter::get_context_window_size;
-use super::cache::CacheUsage;
 
 /// 流处理上下文
 pub struct StreamContext {
@@ -528,6 +531,8 @@ pub struct StreamContext {
     pub cache_creation_input_tokens: i32,
     /// 本次请求读取的缓存输入 tokens
     pub cache_read_input_tokens: i32,
+    /// 流结束后用上游 contextUsageEvent 的 token 数更新缓存统计。
+    cache_tracker: Option<(Arc<VirtualInputCache>, String)>,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
@@ -583,6 +588,7 @@ impl StreamContext {
             output_tokens: 0,
             cache_creation_input_tokens: cache_usage.cache_creation_input_tokens,
             cache_read_input_tokens: cache_usage.cache_read_input_tokens,
+            cache_tracker: None,
             tool_block_indices: HashMap::new(),
             tool_name_map,
             thinking_enabled,
@@ -593,6 +599,27 @@ impl StreamContext {
             text_block_index: None,
             strip_thinking_leading_newline: false,
         }
+    }
+
+    /// 创建带缓存统计跟踪的流处理上下文。
+    pub fn new_with_cache_tracking(
+        model: impl Into<String>,
+        input_tokens: i32,
+        thinking_enabled: bool,
+        tool_name_map: HashMap<String, String>,
+        cache_usage: CacheUsage,
+        input_cache: Arc<VirtualInputCache>,
+        cache_key: String,
+    ) -> Self {
+        let mut context = Self::new_with_cache_usage(
+            model,
+            input_tokens,
+            thinking_enabled,
+            tool_name_map,
+            cache_usage,
+        );
+        context.cache_tracker = Some((input_cache, cache_key));
+        context
     }
 
     /// 生成 message_start 事件
@@ -1146,10 +1173,23 @@ impl StreamContext {
         // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
         let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
 
+        if let Some((input_cache, cache_key)) = self.cache_tracker.take() {
+            let cache_usage = input_cache.record(cache_key, final_input_tokens);
+            self.cache_creation_input_tokens = cache_usage.cache_creation_input_tokens;
+            self.cache_read_input_tokens = cache_usage.cache_read_input_tokens;
+        }
+
         // 生成最终事件
         events.extend(
             self.state_manager
-                .generate_final_events(final_input_tokens, self.output_tokens),
+                .generate_final_events_with_cache(
+                    final_input_tokens,
+                    self.output_tokens,
+                    CacheUsage {
+                        cache_creation_input_tokens: self.cache_creation_input_tokens,
+                        cache_read_input_tokens: self.cache_read_input_tokens,
+                    },
+                ),
         );
         events
     }
@@ -1174,6 +1214,8 @@ pub struct BufferedStreamContext {
     estimated_input_tokens: i32,
     /// 是否已经生成了初始事件
     initial_events_generated: bool,
+    /// 缓冲流结束时使用上游实际 token 数登记缓存。
+    input_cache: Option<(Arc<VirtualInputCache>, String)>,
 }
 
 impl BufferedStreamContext {
@@ -1197,7 +1239,28 @@ impl BufferedStreamContext {
             event_buffer: Vec::new(),
             estimated_input_tokens,
             initial_events_generated: false,
+            input_cache: None,
         }
+    }
+
+    /// 创建带缓存统计跟踪的缓冲流上下文。
+    pub fn new_with_cache_tracking(
+        model: impl Into<String>,
+        estimated_input_tokens: i32,
+        thinking_enabled: bool,
+        tool_name_map: HashMap<String, String>,
+        input_cache: Arc<VirtualInputCache>,
+        cache_key: String,
+    ) -> Self {
+        let mut context = Self::new_with_cache_usage(
+            model,
+            estimated_input_tokens,
+            thinking_enabled,
+            tool_name_map,
+            CacheUsage::default(),
+        );
+        context.input_cache = Some((input_cache, cache_key));
+        context
     }
 
     /// 处理 Kiro 事件并缓冲结果
@@ -1240,12 +1303,22 @@ impl BufferedStreamContext {
             .context_input_tokens
             .unwrap_or(self.estimated_input_tokens);
 
+        if let Some((input_cache, cache_key)) = self.input_cache.take() {
+            let cache_usage = input_cache.record(cache_key, final_input_tokens);
+            self.inner.cache_creation_input_tokens = cache_usage.cache_creation_input_tokens;
+            self.inner.cache_read_input_tokens = cache_usage.cache_read_input_tokens;
+        }
+
         // 更正 message_start 事件中的 input_tokens
         for event in &mut self.event_buffer {
             if event.event == "message_start" {
                 if let Some(message) = event.data.get_mut("message") {
                     if let Some(usage) = message.get_mut("usage") {
                         usage["input_tokens"] = serde_json::json!(final_input_tokens);
+                        usage["cache_creation_input_tokens"] =
+                            serde_json::json!(self.inner.cache_creation_input_tokens);
+                        usage["cache_read_input_tokens"] =
+                            serde_json::json!(self.inner.cache_read_input_tokens);
                     }
                 }
             }
@@ -1322,6 +1395,37 @@ mod tests {
         assert_eq!(usage["input_tokens"], 100);
         assert_eq!(usage["cache_creation_input_tokens"], 7);
         assert_eq!(usage["cache_read_input_tokens"], 93);
+    }
+
+    #[test]
+    fn stream_final_usage_reconciles_cache_with_upstream_context_tokens() {
+        let input_cache = Arc::new(VirtualInputCache::with_limits(
+            std::time::Duration::from_secs(60),
+            10,
+        ));
+        input_cache.record("conversation-1", 100);
+        let preview = input_cache.preview("conversation-1", 110);
+        let mut ctx = StreamContext::new_with_cache_tracking(
+            "test-model",
+            110,
+            false,
+            HashMap::new(),
+            preview,
+            input_cache.clone(),
+            "conversation-1".to_string(),
+        );
+        let _ = ctx.generate_initial_events();
+        ctx.context_input_tokens = Some(200);
+
+        let events = ctx.generate_final_events();
+        let message_delta = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("should emit message_delta");
+
+        assert_eq!(message_delta.data["usage"]["input_tokens"], 200);
+        assert_eq!(message_delta.data["usage"]["cache_read_input_tokens"], 100);
+        assert_eq!(message_delta.data["usage"]["cache_creation_input_tokens"], 100);
     }
 
     #[test]

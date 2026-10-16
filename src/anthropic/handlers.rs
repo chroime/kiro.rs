@@ -450,15 +450,17 @@ async fn handle_stream_request(
         Err(e) => return map_provider_error(e),
     };
 
-    let cache_usage = input_cache.record(cache_key, input_tokens);
+    let cache_usage = input_cache.preview(&cache_key, input_tokens);
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_cache_usage(
+    let mut ctx = StreamContext::new_with_cache_tracking(
         model,
         input_tokens,
         thinking_enabled,
         tool_name_map,
         cache_usage,
+        input_cache,
+        cache_key,
     );
 
     // 生成初始事件
@@ -612,8 +614,6 @@ async fn handle_non_stream_request(
         }
     };
 
-    let cache_usage = input_cache.record(cache_key, input_tokens);
-
     // 解析事件流
     let mut decoder = EventStreamDecoder::new();
     if let Err(e) = decoder.feed(&body_bytes) {
@@ -749,6 +749,7 @@ async fn handle_non_stream_request(
 
     // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
     let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
+    let cache_usage = input_cache.record(cache_key, final_input_tokens);
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -995,15 +996,14 @@ async fn handle_stream_request_buffered(
         Err(e) => return map_provider_error(e),
     };
 
-    let cache_usage = input_cache.record(cache_key, estimated_input_tokens);
-
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new_with_cache_usage(
+    let ctx = BufferedStreamContext::new_with_cache_tracking(
         model,
         estimated_input_tokens,
         thinking_enabled,
         tool_name_map,
-        cache_usage,
+        input_cache,
+        cache_key,
     );
 
     // 创建缓冲 SSE 流

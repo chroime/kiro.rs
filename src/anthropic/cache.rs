@@ -52,6 +52,35 @@ impl VirtualInputCache {
         }
     }
 
+    fn previous_cached_tokens(
+        &self,
+        entries: &HashMap<String, CacheEntry>,
+        key: &str,
+        now: Instant,
+    ) -> i32 {
+        entries
+            .get(key)
+            .filter(|entry| now.duration_since(entry.last_used) <= self.ttl)
+            .map(|entry| entry.cached_input_tokens)
+            .unwrap_or(0)
+    }
+
+    /// Calculate counters without changing the cache entry.
+    ///
+    /// A live stream uses this for its initial event and records the
+    /// authoritative input count when the upstream stream finishes.
+    pub fn preview(&self, key: &str, input_tokens: i32) -> CacheUsage {
+        let input_tokens = input_tokens.max(0);
+        let entries = self.entries.lock();
+        let cache_read = self
+            .previous_cached_tokens(&entries, key, Instant::now())
+            .min(input_tokens);
+        CacheUsage {
+            cache_creation_input_tokens: input_tokens - cache_read,
+            cache_read_input_tokens: cache_read,
+        }
+    }
+
     /// Record the current request and return its cache usage counters.
     pub fn record(&self, key: impl Into<String>, input_tokens: i32) -> CacheUsage {
         let key = key.into();
@@ -59,17 +88,15 @@ impl VirtualInputCache {
         let now = Instant::now();
         let mut entries = self.entries.lock();
 
-        let previous = entries.remove(&key).and_then(|entry| {
-            (now.duration_since(entry.last_used) <= self.ttl)
-                .then_some(entry.cached_input_tokens)
-        });
-        let cache_read = previous.unwrap_or(0).min(input_tokens);
+        let cache_read = self
+            .previous_cached_tokens(&entries, &key, now)
+            .min(input_tokens);
         let usage = CacheUsage {
             cache_creation_input_tokens: input_tokens - cache_read,
             cache_read_input_tokens: cache_read,
         };
 
-        if entries.len() >= self.max_entries {
+        if !entries.contains_key(&key) && entries.len() >= self.max_entries {
             if let Some(oldest_key) = entries
                 .iter()
                 .min_by_key(|(_, entry)| entry.last_used)
@@ -134,6 +161,19 @@ mod tests {
 
         assert_eq!(usage.cache_read_input_tokens, 100);
         assert_eq!(usage.cache_creation_input_tokens, 20);
+    }
+
+    #[test]
+    fn preview_does_not_consume_or_replace_the_cached_prefix() {
+        let cache = VirtualInputCache::with_limits(std::time::Duration::from_secs(60), 10);
+
+        cache.record("conversation-1", 100);
+        let preview = cache.preview("conversation-1", 120);
+        let recorded = cache.record("conversation-1", 120);
+
+        assert_eq!(preview, recorded);
+        assert_eq!(recorded.cache_read_input_tokens, 100);
+        assert_eq!(recorded.cache_creation_input_tokens, 20);
     }
 
     #[test]
