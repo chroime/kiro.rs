@@ -91,6 +91,12 @@ pub struct Config {
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
+    /// 单个凭据允许同时进行的上游请求数，默认串行处理。
+    ///
+    /// 设为大于 1 可提高单账号吞吐量；设为 1 时可以避免同一账号的请求互相抢占上游会话。
+    #[serde(default = "default_max_concurrency_per_credential")]
+    pub max_concurrency_per_credential: usize,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -151,6 +157,10 @@ fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
 
+fn default_max_concurrency_per_credential() -> usize {
+    1
+}
+
 fn default_extract_thinking() -> bool {
     true
 }
@@ -181,6 +191,7 @@ impl Default for Config {
             proxy_password: None,
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
+            max_concurrency_per_credential: default_max_concurrency_per_credential(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),

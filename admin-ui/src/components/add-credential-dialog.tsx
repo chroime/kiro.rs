@@ -20,6 +20,7 @@ interface AddCredentialDialogProps {
 type AuthMethod = 'social' | 'idc' | 'api_key'
 
 export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
+  const [email, setEmail] = useState('')
   const [refreshToken, setRefreshToken] = useState('')
   const [kiroApiKey, setKiroApiKey] = useState('')
   const [authMethod, setAuthMethod] = useState<AuthMethod>('social')
@@ -37,6 +38,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const { mutate, isPending } = useAddCredential()
 
   const resetForm = () => {
+    setEmail('')
     setRefreshToken('')
     setKiroApiKey('')
     setAuthMethod('social')
@@ -78,6 +80,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     mutate(
       {
         authMethod,
+        email: email.trim() || undefined,
         refreshToken: isApiKey ? undefined : refreshToken.trim(),
         kiroApiKey: isApiKey ? kiroApiKey.trim() : undefined,
         authRegion: authRegion.trim() || undefined,
@@ -147,6 +150,21 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 />
               </div>
             )}
+
+            {/* 账号邮箱 */}
+            <div className="space-y-2">
+              <label htmlFor="email" className="text-sm font-medium">
+                账号邮箱
+              </label>
+              <Input
+                id="email"
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="用于区分凭据，可选"
+                disabled={isPending}
+              />
+            </div>
 
             {/* Refresh Token (OAuth 模式) */}
             {!isApiKey && (

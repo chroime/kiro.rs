@@ -422,7 +422,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
     // 初始化结果，所有凭据状态为 pending
     const initialResults = new Map<number, VerifyResult>()
     ids.forEach(id => {
-      initialResults.set(id, { id, status: 'pending' })
+      initialResults.set(id, {
+        id,
+        email: data?.credentials.find(credential => credential.id === id)?.email || undefined,
+        status: 'pending',
+      })
     })
     setVerifyResults(initialResults)
     setVerifyDialogOpen(true)
@@ -601,7 +605,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </CardHeader>
             <CardContent>
               <div className="text-2xl font-bold flex items-center gap-2">
-                #{data?.currentId || '-'}
+                {data?.credentials.find((credential) => credential.id === data?.currentId)?.email || '未记录邮箱'}
                 <Badge variant="success">活跃</Badge>
               </div>
             </CardContent>

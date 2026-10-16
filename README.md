@@ -217,9 +217,12 @@ docker-compose up
    "proxyPassword": "pass",
    "adminApiKey": "sk-admin-your-secret-key",
    "loadBalancingMode": "priority",
+   "maxConcurrencyPerCredential": 1,
    "extractThinking": true
 }
 ```
+
+`maxConcurrencyPerCredential` 控制单个凭据同时进行的上游请求数，默认值为 `1`。请求中的 `conversationState.conversationId` 会在服务进程内与成功使用的凭据保持 30 分钟会话粘连；凭据失效时会自动解除粘连并故障转移。
 
 ### credentials.json
 

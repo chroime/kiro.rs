@@ -113,6 +113,7 @@ export interface AddProxyResponse extends SuccessResponse {
 
 // 添加凭据请求
 export interface AddCredentialRequest {
+  email?: string
   refreshToken?: string
   authMethod?: 'social' | 'idc' | 'api_key'
   clientId?: string

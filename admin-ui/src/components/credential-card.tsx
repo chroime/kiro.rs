@@ -59,6 +59,7 @@ export function CredentialCard({
   balance,
   loadingBalance,
 }: CredentialCardProps) {
+  const displayName = credential.email?.trim() || credential.maskedApiKey || '未记录邮箱'
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
@@ -212,7 +213,7 @@ export function CredentialCard({
                 onCheckedChange={onToggleSelect}
               />
               <CardTitle className="text-lg flex items-center gap-2">
-                {credential.email || `凭据 #${credential.id}`}
+                {displayName}
                 {credential.isCurrent && (
                   <Badge variant="success">当前</Badge>
                 )}
@@ -447,7 +448,7 @@ export function CredentialCard({
           <DialogHeader>
             <DialogTitle>确认删除凭据</DialogTitle>
             <DialogDescription>
-              您确定要删除凭据 #{credential.id} 吗？此操作无法撤销。
+              您确定要删除账号“{displayName}”吗？此操作无法撤销。
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -475,7 +476,7 @@ export function CredentialCard({
           <DialogHeader>
             <DialogTitle>{credential.hasProxy ? '编辑代理配置' : '设置代理配置'}</DialogTitle>
             <DialogDescription>
-              代理只对凭据 #{credential.id} 生效，不会修改该凭据的 Token。支持 HTTP、HTTPS、SOCKS5 和 direct。
+              代理只对账号“{displayName}”生效，不会修改该账号的 Token。支持 HTTP、HTTPS、SOCKS5 和 direct。
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4">

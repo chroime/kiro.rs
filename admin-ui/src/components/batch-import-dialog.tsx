@@ -19,6 +19,7 @@ interface BatchImportDialogProps {
 }
 
 interface CredentialInput {
+  email?: string
   refreshToken?: string
   clientId?: string
   clientSecret?: string
@@ -229,6 +230,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             const addedCred = await addCredential({
               authMethod: 'api_key',
               kiroApiKey: cred.kiroApiKey?.trim(),
+              email: cred.email?.trim() || undefined,
               priority: cred.priority || 0,
               authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
               apiRegion: cred.apiRegion?.trim() || undefined,
@@ -276,6 +278,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           const addedCred = await addCredential({
             refreshToken: token,
             authMethod,
+            email: cred.email?.trim() || undefined,
             authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
             apiRegion: cred.apiRegion?.trim() || undefined,
             clientId,
@@ -476,7 +479,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2">
                           <span className="text-sm font-medium">
-                            {result.email || `凭据 #${result.index}`}
+                            {result.email || '未记录邮箱'}
                           </span>
                           <span className="text-xs text-muted-foreground">
                             {getStatusText(result)}

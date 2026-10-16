@@ -5,6 +5,8 @@
 //! 支持多凭据故障转移和重试
 //! 支持按凭据级 endpoint 切换不同 Kiro API 端点
 
+use bytes::Bytes;
+use futures::{StreamExt, stream};
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -16,6 +18,7 @@ use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
+use tokio::sync::OwnedSemaphorePermit;
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
@@ -24,6 +27,39 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
+
+/// 带有凭据并发 permit 的上游响应。
+///
+/// permit 包装在响应中，直到非流式响应体或流式响应全部读取完毕才释放，
+/// 因此单账号并发控制覆盖整个上游请求生命周期。
+pub struct ProviderResponse {
+    response: reqwest::Response,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl ProviderResponse {
+    pub async fn bytes(self) -> Result<Bytes, reqwest::Error> {
+        self.response.bytes().await
+    }
+
+    pub async fn text(self) -> Result<String, reqwest::Error> {
+        self.response.text().await
+    }
+
+    pub fn bytes_stream(self) -> futures::stream::BoxStream<'static, Result<Bytes, reqwest::Error>> {
+        let response_stream = self.response.bytes_stream();
+        stream::unfold(
+            (response_stream, self.permit),
+            |(mut response_stream, permit)| async move {
+                response_stream
+                    .next()
+                    .await
+                    .map(|item| (item, (response_stream, permit)))
+            },
+        )
+        .boxed()
+    }
+}
 
 /// Kiro API Provider
 ///
@@ -108,22 +144,22 @@ impl KiroProvider {
     /// 发送非流式 API 请求
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
-    pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    pub async fn call_api(&self, request_body: &str) -> anyhow::Result<ProviderResponse> {
         self.call_api_with_retry(request_body, false).await
     }
 
     /// 发送流式 API 请求
-    pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<ProviderResponse> {
         self.call_api_with_retry(request_body, true).await
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
-    pub async fn call_mcp(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    pub async fn call_mcp(&self, request_body: &str) -> anyhow::Result<ProviderResponse> {
         self.call_mcp_with_retry(request_body).await
     }
 
     /// 内部方法：带重试逻辑的 MCP API 调用
-    async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<ProviderResponse> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
@@ -192,7 +228,10 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
-                return Ok(response);
+                return Ok(ProviderResponse {
+                    response,
+                    permit: ctx.permit,
+                });
             }
 
             // 失败响应
@@ -277,7 +316,7 @@ impl KiroProvider {
         &self,
         request_body: &str,
         is_stream: bool,
-    ) -> anyhow::Result<reqwest::Response> {
+    ) -> anyhow::Result<ProviderResponse> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
@@ -286,10 +325,15 @@ impl KiroProvider {
 
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
+        let session_key = Self::extract_session_key_from_request(request_body);
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
+            let ctx = match self
+                .token_manager
+                .acquire_context_with_session(model.as_deref(), session_key.as_deref())
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -351,7 +395,10 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
-                return Ok(response);
+                return Ok(ProviderResponse {
+                    response,
+                    permit: ctx.permit,
+                });
             }
 
             // 失败响应：读取 body 用于日志/错误信息
@@ -501,6 +548,19 @@ impl KiroProvider {
             .get("modelId")?
             .as_str()
             .map(|s| s.to_string())
+    }
+
+    /// 从已转换的 Kiro 请求中提取会话 ID，用于凭据粘连。
+    fn extract_session_key_from_request(request_body: &str) -> Option<String> {
+        use serde_json::Value;
+
+        let json: Value = serde_json::from_str(request_body).ok()?;
+        let conversation_id = json
+            .get("conversationState")?
+            .get("conversationId")?
+            .as_str()?
+            .trim();
+        (!conversation_id.is_empty()).then(|| conversation_id.to_string())
     }
 
     fn retry_delay(attempt: usize) -> Duration {

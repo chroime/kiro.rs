@@ -8,7 +8,7 @@ use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
 
 use std::collections::HashMap;
 use std::fmt;
@@ -530,6 +530,10 @@ pub struct MultiTokenManager {
     proxy_pool: std::sync::Arc<ProxyPool>,
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
+    /// 每个凭据的并发闸门；permit 会一直持有到上游响应体读取完成。
+    concurrency_limits: Mutex<HashMap<u64, std::sync::Arc<Semaphore>>>,
+    /// 会话到凭据的临时粘连映射。
+    session_bindings: Mutex<HashMap<String, SessionBinding>>,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -540,12 +544,21 @@ pub struct MultiTokenManager {
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
+/// 会话粘连的空闲有效期；过期后允许重新选择凭据。
+const SESSION_STICKY_TTL: StdDuration = StdDuration::from_secs(30 * 60);
+/// 防止异常客户端不断创建会话键导致内存无界增长。
+const MAX_SESSION_BINDINGS: usize = 10_000;
+
+#[derive(Debug, Clone)]
+struct SessionBinding {
+    credential_id: u64,
+    last_used: Instant,
+}
 
 /// API 调用上下文
 ///
 /// 绑定特定凭据的调用上下文，确保 token、credentials 和 id 的一致性
 /// 用于解决并发调用时 current_id 竞态问题
-#[derive(Clone)]
 pub struct CallContext {
     /// 凭据 ID（用于 report_success/report_failure）
     pub id: u64,
@@ -553,6 +566,8 @@ pub struct CallContext {
     pub credentials: KiroCredentials,
     /// 访问 Token
     pub token: String,
+    /// 单账号并发 permit；响应体消费完毕后随 ProviderResponse 一起释放。
+    pub(crate) permit: Option<OwnedSemaphorePermit>,
 }
 
 impl MultiTokenManager {
@@ -671,6 +686,16 @@ impl MultiTokenManager {
             .unwrap_or(0);
 
         let load_balancing_mode = config.load_balancing_mode.clone();
+        let max_concurrency = config.max_concurrency_per_credential.max(1);
+        let concurrency_limits = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.id,
+                    std::sync::Arc::new(Semaphore::new(max_concurrency)),
+                )
+            })
+            .collect();
         let manager = Self {
             config,
             proxy,
@@ -681,6 +706,8 @@ impl MultiTokenManager {
             is_multiple_format,
             proxy_pool,
             load_balancing_mode: Mutex::new(load_balancing_mode),
+            concurrency_limits: Mutex::new(concurrency_limits),
+            session_bindings: Mutex::new(HashMap::new()),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
         };
@@ -778,6 +805,67 @@ impl MultiTokenManager {
         }
     }
 
+    fn credential_supports_model(credentials: &KiroCredentials, model: Option<&str>) -> bool {
+        let is_opus = model
+            .map(|m| m.to_lowercase().contains("opus"))
+            .unwrap_or(false);
+        !is_opus || credentials.supports_opus()
+    }
+
+    fn sticky_credential_id(&self, session_key: &str) -> Option<u64> {
+        let mut bindings = self.session_bindings.lock();
+        let binding = bindings.get_mut(session_key)?;
+        if binding.last_used.elapsed() > SESSION_STICKY_TTL {
+            bindings.remove(session_key);
+            return None;
+        }
+        binding.last_used = Instant::now();
+        Some(binding.credential_id)
+    }
+
+    fn bind_session(&self, session_key: &str, credential_id: u64) {
+        let mut bindings = self.session_bindings.lock();
+        if bindings.len() >= MAX_SESSION_BINDINGS && !bindings.contains_key(session_key) {
+            if let Some(oldest_key) = bindings
+                .iter()
+                .min_by_key(|(_, binding)| binding.last_used)
+                .map(|(key, _)| key.clone())
+            {
+                bindings.remove(&oldest_key);
+            }
+        }
+        bindings.insert(
+            session_key.to_string(),
+            SessionBinding {
+                credential_id,
+                last_used: Instant::now(),
+            },
+        );
+    }
+
+    fn unbind_session_if_matches(&self, session_key: &str, credential_id: u64) {
+        let mut bindings = self.session_bindings.lock();
+        if bindings
+            .get(session_key)
+            .is_some_and(|binding| binding.credential_id == credential_id)
+        {
+            bindings.remove(session_key);
+        }
+    }
+
+    async fn acquire_credential_permit(&self, credential_id: u64) -> anyhow::Result<OwnedSemaphorePermit> {
+        let semaphore = self
+            .concurrency_limits
+            .lock()
+            .get(&credential_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("凭据 #{} 并发控制器不存在", credential_id))?;
+        semaphore
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("凭据 #{} 并发控制器已关闭", credential_id))
+    }
+
     /// 获取 API 调用上下文
     ///
     /// 返回绑定了 id、credentials 和 token 的调用上下文
@@ -789,6 +877,18 @@ impl MultiTokenManager {
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
     pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
+        self.acquire_context_with_session(model, None).await
+    }
+
+    /// 获取带会话粘连的 API 调用上下文。
+    ///
+    /// 当 `session_key` 有值时，首次成功获取上下文会绑定一个凭据；
+    /// 后续同一会话优先复用该凭据，直到凭据失效或粘连 TTL 到期。
+    pub async fn acquire_context_with_session(
+        &self,
+        model: Option<&str>,
+        session_key: Option<&str>,
+    ) -> anyhow::Result<CallContext> {
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -805,16 +905,40 @@ impl MultiTokenManager {
             let (id, credentials) = {
                 let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
 
+                let sticky_id = session_key.and_then(|key| self.sticky_credential_id(key));
+                let sticky_hit = sticky_id.and_then(|sticky_id| {
+                    let entries = self.entries.lock();
+                    entries
+                        .iter()
+                        .find(|e| {
+                            e.id == sticky_id
+                                && !e.disabled
+                                && Self::credential_supports_model(&e.credentials, model)
+                        })
+                        .map(|e| (e.id, e.credentials.clone()))
+                });
+                if sticky_id.is_some() && sticky_hit.is_none() {
+                    if let Some(key) = session_key {
+                        self.unbind_session_if_matches(key, sticky_id.unwrap());
+                    }
+                }
+
                 // balanced 模式：每次请求都重新均衡选择，不固定 current_id
                 // priority 模式：优先使用 current_id 指向的凭据
-                let current_hit = if is_balanced {
+                let current_hit = if sticky_hit.is_some() {
+                    sticky_hit
+                } else if is_balanced {
                     None
                 } else {
                     let entries = self.entries.lock();
                     let current_id = *self.current_id.lock();
                     entries
                         .iter()
-                        .find(|e| e.id == current_id && !e.disabled)
+                        .find(|e| {
+                            e.id == current_id
+                                && !e.disabled
+                                && Self::credential_supports_model(&e.credentials, model)
+                        })
                         .map(|e| (e.id, e.credentials.clone()))
                 };
 
@@ -861,12 +985,19 @@ impl MultiTokenManager {
                 }
             };
 
+            if let Some(key) = session_key {
+                self.bind_session(key, id);
+            }
+
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
                 Ok(ctx) => {
                     return Ok(ctx);
                 }
                 Err(e) => {
+                    if let Some(key) = session_key {
+                        self.unbind_session_if_matches(key, id);
+                    }
                     // refreshToken 永久失效 → 立即禁用，不累计重试
                     let has_available =
                         if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
@@ -928,10 +1059,12 @@ impl MultiTokenManager {
                 .kiro_api_key
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?;
+            let permit = self.acquire_credential_permit(id).await?;
             return Ok(CallContext {
                 id,
                 credentials: credentials.clone(),
                 token,
+                permit: Some(permit),
             });
         }
 
@@ -1001,6 +1134,7 @@ impl MultiTokenManager {
             id,
             credentials: creds,
             token,
+            permit: Some(self.acquire_credential_permit(id).await?),
         })
     }
 
@@ -1739,7 +1873,10 @@ impl MultiTokenManager {
         };
 
         let effective_proxy = self.effective_proxy_for(&credentials);
-        let usage_limits = get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
+        let permit = self.acquire_credential_permit(id).await?;
+        let usage_limits =
+            get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
+        drop(permit);
 
         // 更新订阅等级到凭据（仅在发生变化时持久化）
         if let Some(subscription_title) = usage_limits.subscription_title() {
@@ -1896,6 +2033,12 @@ impl MultiTokenManager {
                 last_used_at: None,
             });
         }
+        self.concurrency_limits.lock().insert(
+            new_id,
+            std::sync::Arc::new(Semaphore::new(
+                self.config.max_concurrency_per_credential.max(1),
+            )),
+        );
 
         // 6. 持久化
         self.persist_credentials()?;
@@ -1959,6 +2102,10 @@ impl MultiTokenManager {
                 tracing::info!("所有凭据已删除，current_id 已重置为 0");
             }
         }
+        self.concurrency_limits.lock().remove(&id);
+        self.session_bindings
+            .lock()
+            .retain(|_, binding| binding.credential_id != id);
 
         // 持久化更改
         self.persist_credentials()?;
@@ -2637,6 +2784,68 @@ mod tests {
         let ctx = manager.acquire_context(None).await.unwrap();
         assert_eq!(ctx.id, 2);
         assert_eq!(ctx.token, "good-token");
+    }
+
+    #[tokio::test]
+    async fn test_session_sticky_reuses_same_credential_in_balanced_mode() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut first = KiroCredentials::default();
+        first.kiro_api_key = Some("ksk_first".to_string());
+        first.auth_method = Some("api_key".to_string());
+        let mut second = KiroCredentials::default();
+        second.kiro_api_key = Some("ksk_second".to_string());
+        second.auth_method = Some("api_key".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![first, second], None, None, false)
+            .unwrap();
+        let first_context = manager
+            .acquire_context_with_session(None, Some("conversation-1"))
+            .await
+            .unwrap();
+        let first_id = first_context.id;
+        drop(first_context);
+
+        let second_context = manager
+            .acquire_context_with_session(None, Some("conversation-1"))
+            .await
+            .unwrap();
+        assert_eq!(second_context.id, first_id);
+    }
+
+    #[tokio::test]
+    async fn test_credential_concurrency_limit_blocks_until_permit_is_released() {
+        let mut config = Config::default();
+        config.max_concurrency_per_credential = 1;
+        let mut credential = KiroCredentials::default();
+        credential.kiro_api_key = Some("ksk_only".to_string());
+        credential.auth_method = Some("api_key".to_string());
+
+        let manager = std::sync::Arc::new(
+            MultiTokenManager::new(config, vec![credential], None, None, false).unwrap(),
+        );
+        let first_context = manager.acquire_context(None).await.unwrap();
+        let waiting_manager = manager.clone();
+        let mut waiting = tokio::spawn(async move { waiting_manager.acquire_context(None).await });
+
+        assert!(tokio::time::timeout(
+            StdDuration::from_millis(50),
+            &mut waiting,
+        )
+        .await
+        .is_err());
+
+        drop(first_context);
+        let second_context = tokio::time::timeout(
+            StdDuration::from_secs(1),
+            &mut waiting,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        drop(second_context);
     }
 
     #[test]

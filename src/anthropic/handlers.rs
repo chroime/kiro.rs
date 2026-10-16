@@ -26,6 +26,7 @@ use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
 use super::websearch;
+use crate::kiro::provider::ProviderResponse;
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
@@ -451,7 +452,7 @@ fn create_ping_sse() -> Bytes {
 
 /// 创建 SSE 事件流
 fn create_sse_stream(
-    response: reqwest::Response,
+    response: ProviderResponse,
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
@@ -965,7 +966,7 @@ async fn handle_stream_request_buffered(
 /// 3. 流结束后，用正确的 input_tokens 更正 message_start 事件
 /// 4. 一次性发送所有事件
 fn create_buffered_sse_stream(
-    response: reqwest::Response,
+    response: ProviderResponse,
     ctx: BufferedStreamContext,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
