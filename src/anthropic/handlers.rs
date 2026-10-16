@@ -22,6 +22,7 @@ use tokio::time::interval;
 use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request};
+use super::cache::{self, CacheUsage, VirtualInputCache};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
@@ -66,6 +67,15 @@ fn map_provider_error(err: Error) -> Response {
         )),
     )
         .into_response()
+}
+
+fn build_usage(input_tokens: i32, output_tokens: i32, cache_usage: CacheUsage) -> serde_json::Value {
+    json!({
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_creation_input_tokens": cache_usage.cache_creation_input_tokens,
+        "cache_read_input_tokens": cache_usage.cache_read_input_tokens
+    })
 }
 
 /// GET /v1/models
@@ -326,7 +336,8 @@ pub async fn post_messages(
             payload.tools.clone(),
         ) as i32;
 
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        let cache_usage = state.input_cache.record(cache::cache_key(&payload), input_tokens);
+        return websearch::handle_websearch_request(provider, &payload, input_tokens, cache_usage).await;
     }
 
     // 转换请求
@@ -373,6 +384,8 @@ pub async fn post_messages(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
+    let cache_key = cache::cache_key(&payload);
+
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -399,12 +412,24 @@ pub async fn post_messages(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            state.input_cache.clone(),
+            cache_key,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            extract_thinking,
+            tool_name_map,
+            state.input_cache.clone(),
+            cache_key,
+        )
+        .await
     }
 }
 
@@ -416,6 +441,8 @@ async fn handle_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    input_cache: std::sync::Arc<VirtualInputCache>,
+    cache_key: String,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
@@ -423,8 +450,16 @@ async fn handle_stream_request(
         Err(e) => return map_provider_error(e),
     };
 
+    let cache_usage = input_cache.record(cache_key, input_tokens);
+
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    let mut ctx = StreamContext::new_with_cache_usage(
+        model,
+        input_tokens,
+        thinking_enabled,
+        tool_name_map,
+        cache_usage,
+    );
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -552,6 +587,8 @@ async fn handle_non_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    input_cache: std::sync::Arc<VirtualInputCache>,
+    cache_key: String,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api(request_body).await {
@@ -574,6 +611,8 @@ async fn handle_non_stream_request(
                 .into_response();
         }
     };
+
+    let cache_usage = input_cache.record(cache_key, input_tokens);
 
     // 解析事件流
     let mut decoder = EventStreamDecoder::new();
@@ -720,10 +759,7 @@ async fn handle_non_stream_request(
         "model": model,
         "stop_reason": stop_reason,
         "stop_sequence": null,
-        "usage": {
-            "input_tokens": final_input_tokens,
-            "output_tokens": output_tokens
-        }
+        "usage": build_usage(final_input_tokens, output_tokens, cache_usage)
     });
 
     (StatusCode::OK, Json(response_body)).into_response()
@@ -842,7 +878,8 @@ pub async fn post_messages_cc(
             payload.tools.clone(),
         ) as i32;
 
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        let cache_usage = state.input_cache.record(cache::cache_key(&payload), input_tokens);
+        return websearch::handle_websearch_request(provider, &payload, input_tokens, cache_usage).await;
     }
 
     // 转换请求
@@ -889,6 +926,8 @@ pub async fn post_messages_cc(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
+    let cache_key = cache::cache_key(&payload);
+
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -915,12 +954,24 @@ pub async fn post_messages_cc(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            state.input_cache.clone(),
+            cache_key,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            extract_thinking,
+            tool_name_map,
+            state.input_cache.clone(),
+            cache_key,
+        )
+        .await
     }
 }
 
@@ -935,6 +986,8 @@ async fn handle_stream_request_buffered(
     estimated_input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    input_cache: std::sync::Arc<VirtualInputCache>,
+    cache_key: String,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
@@ -942,8 +995,16 @@ async fn handle_stream_request_buffered(
         Err(e) => return map_provider_error(e),
     };
 
+    let cache_usage = input_cache.record(cache_key, estimated_input_tokens);
+
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+    let ctx = BufferedStreamContext::new_with_cache_usage(
+        model,
+        estimated_input_tokens,
+        thinking_enabled,
+        tool_name_map,
+        cache_usage,
+    );
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx);
@@ -1047,4 +1108,26 @@ fn create_buffered_sse_stream(
         },
     )
     .flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_stream_usage_contains_cache_creation_and_read_fields() {
+        let usage = build_usage(
+            100,
+            12,
+            CacheUsage {
+                cache_creation_input_tokens: 8,
+                cache_read_input_tokens: 92,
+            },
+        );
+
+        assert_eq!(usage["input_tokens"], 100);
+        assert_eq!(usage["output_tokens"], 12);
+        assert_eq!(usage["cache_creation_input_tokens"], 8);
+        assert_eq!(usage["cache_read_input_tokens"], 92);
+    }
 }

@@ -224,6 +224,15 @@ docker-compose up
 
 `maxConcurrencyPerCredential` 控制单个凭据同时进行的上游请求数，默认值为 `1`。请求中的 `conversationState.conversationId` 会在服务进程内与成功使用的凭据保持 30 分钟会话粘连；凭据失效时会自动解除粘连并故障转移。
 
+### 缓存 usage
+
+kiro.rs 会在进程内按会话和请求前缀维护轻量的缓存 token 统计，并在 Anthropic 响应的 `usage` 中返回标准字段：
+
+- `cache_creation_input_tokens`：本次新增写入缓存的输入 token 数；
+- `cache_read_input_tokens`：本次复用缓存的输入 token 数。
+
+首次请求会产生缓存写入，后续同一会话会优先报告缓存读取，普通 `input_tokens` 不重复包含缓存读取量。缓存只保存 token 数和时间戳，不保存消息正文；服务重启后缓存统计会重新开始。该字段由 kiro.rs 生成，下游 Sub 无需修改即可读取。
+
 ### credentials.json
 
 支持单对象格式（向后兼容）或数组格式（多凭据）。

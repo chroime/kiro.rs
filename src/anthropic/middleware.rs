@@ -13,6 +13,7 @@ use axum::{
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 
+use super::cache::VirtualInputCache;
 use super::types::ErrorResponse;
 
 /// 应用共享状态
@@ -25,6 +26,8 @@ pub struct AppState {
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
+    /// 进程内虚拟前缀缓存统计器，用于返回标准 cache usage 字段
+    pub input_cache: Arc<VirtualInputCache>,
 }
 
 impl AppState {
@@ -34,6 +37,7 @@ impl AppState {
             api_key: api_key.into(),
             kiro_provider: None,
             extract_thinking,
+            input_cache: Arc::new(VirtualInputCache::new()),
         }
     }
 

@@ -16,6 +16,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::stream::SseEvent;
+use super::cache::CacheUsage;
 use super::types::{ErrorResponse, MessagesRequest};
 
 /// MCP 请求
@@ -220,9 +221,16 @@ pub fn create_websearch_sse_stream(
     tool_use_id: String,
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
+    cache_usage: CacheUsage,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    let events =
-        generate_websearch_events(&model, &query, &tool_use_id, search_results, input_tokens);
+    let events = generate_websearch_events(
+        &model,
+        &query,
+        &tool_use_id,
+        search_results,
+        input_tokens,
+        cache_usage,
+    );
 
     stream::iter(
         events
@@ -238,6 +246,7 @@ fn generate_websearch_events(
     tool_use_id: &str,
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
+    cache_usage: CacheUsage,
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
     let message_id = format!(
@@ -260,8 +269,8 @@ fn generate_websearch_events(
                 "usage": {
                     "input_tokens": input_tokens,
                     "output_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
+                    "cache_creation_input_tokens": cache_usage.cache_creation_input_tokens,
+                    "cache_read_input_tokens": cache_usage.cache_read_input_tokens
                 }
             }
         }),
@@ -475,6 +484,7 @@ pub async fn handle_websearch_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     payload: &MessagesRequest,
     input_tokens: i32,
+    cache_usage: CacheUsage,
 ) -> Response {
     // 1. 提取搜索查询
     let query = match extract_search_query(payload) {
@@ -507,8 +517,14 @@ pub async fn handle_websearch_request(
 
     // 4. 生成 SSE 响应
     let model = payload.model.clone();
-    let stream =
-        create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens);
+    let stream = create_websearch_sse_stream(
+        model,
+        query,
+        tool_use_id,
+        search_results,
+        input_tokens,
+        cache_usage,
+    );
 
     Response::builder()
         .status(StatusCode::OK)

@@ -508,6 +508,7 @@ impl SseStateManager {
 }
 
 use super::converter::get_context_window_size;
+use super::cache::CacheUsage;
 
 /// 流处理上下文
 pub struct StreamContext {
@@ -523,6 +524,10 @@ pub struct StreamContext {
     pub context_input_tokens: Option<i32>,
     /// 输出 tokens 累计
     pub output_tokens: i32,
+    /// 本次请求创建的缓存输入 tokens
+    pub cache_creation_input_tokens: i32,
+    /// 本次请求读取的缓存输入 tokens
+    pub cache_read_input_tokens: i32,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
@@ -552,6 +557,23 @@ impl StreamContext {
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
     ) -> Self {
+        Self::new_with_cache_usage(
+            model,
+            input_tokens,
+            thinking_enabled,
+            tool_name_map,
+            CacheUsage::default(),
+        )
+    }
+
+    /// 创建带缓存 usage 的流处理上下文。
+    pub fn new_with_cache_usage(
+        model: impl Into<String>,
+        input_tokens: i32,
+        thinking_enabled: bool,
+        tool_name_map: HashMap<String, String>,
+        cache_usage: CacheUsage,
+    ) -> Self {
         Self {
             state_manager: SseStateManager::new(),
             model: model.into(),
@@ -559,6 +581,8 @@ impl StreamContext {
             input_tokens,
             context_input_tokens: None,
             output_tokens: 0,
+            cache_creation_input_tokens: cache_usage.cache_creation_input_tokens,
+            cache_read_input_tokens: cache_usage.cache_read_input_tokens,
             tool_block_indices: HashMap::new(),
             tool_name_map,
             thinking_enabled,
@@ -585,7 +609,9 @@ impl StreamContext {
                 "stop_sequence": null,
                 "usage": {
                     "input_tokens": self.input_tokens,
-                    "output_tokens": 1
+                    "output_tokens": 1,
+                    "cache_creation_input_tokens": self.cache_creation_input_tokens,
+                    "cache_read_input_tokens": self.cache_read_input_tokens
                 }
             }
         })
@@ -1151,15 +1177,21 @@ pub struct BufferedStreamContext {
 }
 
 impl BufferedStreamContext {
-    /// 创建缓冲流上下文
-    pub fn new(
+    /// 创建带缓存 usage 的缓冲流上下文。
+    pub fn new_with_cache_usage(
         model: impl Into<String>,
         estimated_input_tokens: i32,
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
+        cache_usage: CacheUsage,
     ) -> Self {
-        let inner =
-            StreamContext::new_with_thinking(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+        let inner = StreamContext::new_with_cache_usage(
+            model,
+            estimated_input_tokens,
+            thinking_enabled,
+            tool_name_map,
+            cache_usage,
+        );
         Self {
             inner,
             event_buffer: Vec::new(),
@@ -1269,6 +1301,27 @@ mod tests {
         // 第二次应该被跳过
         let event = manager.handle_message_start(json!({"type": "message_start"}));
         assert!(event.is_none());
+    }
+
+    #[test]
+    fn message_start_includes_standard_cache_usage_fields() {
+        let cache_usage = CacheUsage {
+            cache_creation_input_tokens: 7,
+            cache_read_input_tokens: 93,
+        };
+        let ctx = StreamContext::new_with_cache_usage(
+            "test-model",
+            100,
+            false,
+            HashMap::new(),
+            cache_usage,
+        );
+
+        let usage = ctx.create_message_start_event()["message"]["usage"].clone();
+
+        assert_eq!(usage["input_tokens"], 100);
+        assert_eq!(usage["cache_creation_input_tokens"], 7);
+        assert_eq!(usage["cache_read_input_tokens"], 93);
     }
 
     #[test]
